@@ -2,7 +2,7 @@ importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js');
 
 // Mobile-optimized configuration
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
-ort.env.backendHint = 'webgl'; // Force WASM for better mobile compatibility
+ort.env.backendHint = 'wasm'; // Force WASM for better mobile compatibility
 ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 2, 4); // Limit threads for mobile
 
