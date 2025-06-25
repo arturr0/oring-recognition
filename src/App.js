@@ -3,7 +3,7 @@ import React, { useEffect, useRef, useState } from 'react';
 const MODEL_INPUT_SIZE = 640;
 const classNames = ['BLOCK', 'INNER', 'OK', 'OUTER', 'SCAR', 'TEAR'];
 const NMS_THRESHOLD = 0.5;
-const CONFIDENCE_THRESHOLD = 0.0;
+const CONFIDENCE_THRESHOLD = 0.1;
 const FRAME_SKIP = 2; // Process every 3rd frame on mobile
 
 function App() {
