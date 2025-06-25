@@ -2,8 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 
 const MODEL_INPUT_SIZE = 640;
 const classNames = ['BLOCK', 'INNER', 'OK', 'OUTER', 'SCAR', 'TEAR'];
-const NMS_THRESHOLD = 0.5; // Intersection over Union threshold for NMS
-const CONFIDENCE_THRESHOLD = 0.4; // Minimum confidence score to consider a detection
+const NMS_THRESHOLD = 0.5;
+const CONFIDENCE_THRESHOLD = 0.4;
 
 function App() {
   const videoRef = useRef(null);
@@ -14,6 +14,11 @@ function App() {
   const [status, setStatus] = useState('loading');
   const [error, setError] = useState(null);
   const [boxes, setBoxes] = useState([]);
+  const [calibrationMode, setCalibrationMode] = useState(false);
+  const [referenceSize, setReferenceSize] = useState(10); // Default 10mm
+  const [calibrationComplete, setCalibrationComplete] = useState(false);
+  const [pixelsPerMM, setPixelsPerMM] = useState(null);
+  const [selectedReferenceBox, setSelectedReferenceBox] = useState(null);
 
   // Initialize webcam
   useEffect(() => {
@@ -103,6 +108,8 @@ function App() {
           y1: y - h / 2,
           x2: x + w / 2,
           y2: y + h / 2,
+          width: w,
+          height: h,
           label: classNames[classId] || 'unknown',
           confidence: totalConf,
           classId: classId
@@ -114,16 +121,13 @@ function App() {
   }
 
   function nonMaxSuppression(boxes) {
-    // Sort boxes by confidence in descending order
     const sortedBoxes = [...boxes].sort((a, b) => b.confidence - a.confidence);
     const selectedBoxes = [];
 
     while (sortedBoxes.length > 0) {
-      // Take the box with highest confidence
       const currentBox = sortedBoxes.shift();
       selectedBoxes.push(currentBox);
 
-      // Filter out boxes that have high IoU with the current box and same class
       for (let i = sortedBoxes.length - 1; i >= 0; i--) {
         if (sortedBoxes[i].classId === currentBox.classId) {
           const iou = calculateIoU(currentBox, sortedBoxes[i]);
@@ -149,6 +153,53 @@ function App() {
     const union = area1 + area2 - intersection;
 
     return intersection / union;
+  }
+
+  function calculatePhysicalSize(box, ppm) {
+    if (!ppm || isNaN(ppm)) return null;
+    
+    const widthPx = box.width * MODEL_INPUT_SIZE;
+    const heightPx = box.height * MODEL_INPUT_SIZE;
+    const diameterPx = (widthPx + heightPx) / 2;
+    return diameterPx / ppm;
+  }
+
+  function handleBoxClick(box) {
+    if (calibrationMode) {
+      setSelectedReferenceBox(box);
+    }
+  }
+
+  function startCalibration() {
+    if (referenceSize > 0 && !isNaN(referenceSize)) {
+      setCalibrationMode(true);
+      setError(null);
+    } else {
+      setError('Please enter a valid reference size first');
+    }
+  }
+
+  function completeCalibration() {
+    if (selectedReferenceBox && referenceSize > 0 && !isNaN(referenceSize)) {
+      const widthPx = selectedReferenceBox.width * MODEL_INPUT_SIZE;
+      const heightPx = selectedReferenceBox.height * MODEL_INPUT_SIZE;
+      const diameterPx = (widthPx + heightPx) / 2;
+      const ppm = diameterPx / referenceSize;
+      
+      setPixelsPerMM(ppm);
+      setCalibrationComplete(true);
+      setCalibrationMode(false);
+      setError(null);
+    } else {
+      setError('Please select a reference object and ensure valid size');
+    }
+  }
+
+  function resetCalibration() {
+    setCalibrationComplete(false);
+    setPixelsPerMM(null);
+    setSelectedReferenceBox(null);
+    setCalibrationMode(false);
   }
 
   // Drawing + inference loop
@@ -177,19 +228,37 @@ function App() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
       // Draw detection boxes
-      ctx.strokeStyle = 'lime';
-      ctx.lineWidth = 2;
-      ctx.font = '14px Arial';
-      ctx.fillStyle = 'lime';
-
       boxes.forEach(box => {
         const x = (box.x1 / MODEL_INPUT_SIZE) * canvas.width;
         const y = (box.y1 / MODEL_INPUT_SIZE) * canvas.height;
         const width = ((box.x2 - box.x1) / MODEL_INPUT_SIZE) * canvas.width;
         const height = ((box.y2 - box.y1) / MODEL_INPUT_SIZE) * canvas.height;
 
+        // Highlight selected reference box
+        if (calibrationMode && selectedReferenceBox === box) {
+          ctx.strokeStyle = 'yellow';
+          ctx.lineWidth = 4;
+        } else {
+          ctx.strokeStyle = box.label === 'OK' ? 'lime' : 'red';
+          ctx.lineWidth = 2;
+        }
+
         ctx.strokeRect(x, y, width, height);
-        ctx.fillText(`${box.label} (${(box.confidence * 100).toFixed(1)}%)`, x, y - 4);
+        
+        // Add label and size information
+        let labelText = `${box.label} (${(box.confidence * 100).toFixed(1)}%)`;
+        
+        if (box.label === 'OK' && pixelsPerMM && !isNaN(pixelsPerMM)) {
+          const sizeMM = calculatePhysicalSize(box, pixelsPerMM);
+          if (sizeMM) {
+            labelText += ` - Ø${sizeMM.toFixed(1)}mm`;
+          }
+        }
+
+        ctx.fillStyle = 'white';
+        ctx.fillRect(x - 2, y - 18, ctx.measureText(labelText).width + 4, 18);
+        ctx.fillStyle = 'black';
+        ctx.fillText(labelText, x, y - 4);
       });
 
       // Run inference only if not already processing
@@ -209,10 +278,52 @@ function App() {
     animationFrameId = requestAnimationFrame(run);
 
     return () => cancelAnimationFrame(animationFrameId);
-  }, [status, boxes]);
+  }, [status, boxes, calibrationMode, selectedReferenceBox, pixelsPerMM]);
 
   return (
-    <div>
+    <div style={{ padding: '20px', maxWidth: '800px', margin: '0 auto' }}>
+      <div style={{ marginBottom: '20px' }}>
+        <h1>O-Ring Size Detection</h1>
+        
+        {!calibrationComplete ? (
+          <div style={{ background: '#f0f0f0', padding: '10px', borderRadius: '5px', marginBottom: '10px' }}>
+            <h3>Calibration Required</h3>
+            <p>Place a reference object of known size in view and enter its diameter:</p>
+            
+            <div style={{ marginBottom: '10px' }}>
+              <label>Reference diameter (mm): </label>
+              <input 
+                type="number" 
+                value={isNaN(referenceSize) ? '' : referenceSize}
+                onChange={(e) => {
+                  const value = parseFloat(e.target.value);
+                  setReferenceSize(isNaN(value) ? 0 : value);
+                }} 
+                step="0.1"
+                min="1"
+                style={{ marginLeft: '10px' }}
+              />
+            </div>
+            
+            {!calibrationMode ? (
+              <button onClick={startCalibration}>Start Calibration</button>
+            ) : (
+              <div>
+                <p>Click on the reference object in the video feed</p>
+                {selectedReferenceBox && (
+                  <button onClick={completeCalibration}>Complete Calibration</button>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div style={{ background: '#e0ffe0', padding: '10px', borderRadius: '5px', marginBottom: '10px' }}>
+            <p>Calibration complete: {pixelsPerMM?.toFixed(2) || 'N/A'} pixels/mm</p>
+            <button onClick={resetCalibration}>Recalibrate</button>
+          </div>
+        )}
+      </div>
+
       <video
         ref={videoRef}
         style={{ display: 'none' }}
@@ -221,10 +332,40 @@ function App() {
       />
       <canvas
         ref={canvasRef}
-        style={{ width: '100%', border: '1px solid #aaa' }}
+        style={{ width: '100%', border: '1px solid #aaa', marginBottom: '10px' }}
+        onClick={(e) => {
+          if (!calibrationMode || !boxes.length) return;
+          
+          const rect = canvasRef.current.getBoundingClientRect();
+          const scaleX = canvasRef.current.width / rect.width;
+          const scaleY = canvasRef.current.height / rect.height;
+          
+          const x = (e.clientX - rect.left) * scaleX;
+          const y = (e.clientY - rect.top) * scaleY;
+          
+          // Find clicked box with tolerance
+          const clickedBox = boxes.find(box => {
+            const boxX = (box.x1 / MODEL_INPUT_SIZE) * canvasRef.current.width;
+            const boxY = (box.y1 / MODEL_INPUT_SIZE) * canvasRef.current.height;
+            const boxWidth = ((box.x2 - box.x1) / MODEL_INPUT_SIZE) * canvasRef.current.width;
+            const boxHeight = ((box.y2 - box.y1) / MODEL_INPUT_SIZE) * canvasRef.current.height;
+            
+            return x >= boxX - 10 && 
+                   x <= boxX + boxWidth + 10 && 
+                   y >= boxY - 10 && 
+                   y <= boxY + boxHeight + 10;
+          });
+          
+          if (clickedBox) {
+            handleBoxClick(clickedBox);
+          }
+        }}
       />
-      <div>Status: {status}</div>
-      {error && <div style={{ color: 'red' }}>{error}</div>}
+      
+      <div style={{ marginTop: '10px' }}>
+        <div>Status: {status}</div>
+        {error && <div style={{ color: 'red', marginTop: '10px' }}>{error}</div>}
+      </div>
     </div>
   );
 }
