@@ -1,18 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 const MODEL_INPUT_SIZE = 640;
 const classNames = ['BLOCK', 'INNER', 'OK', 'OUTER', 'SCAR', 'TEAR'];
 const NMS_THRESHOLD = 0.5;
 const CONFIDENCE_THRESHOLD = 0.4;
-const FRAME_SKIP = 2; // Process every 3rd frame on mobile
 
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const workerRef = useRef(null);
   const isProcessingRef = useRef(false);
-  const frameCountRef = useRef(0);
-  const deviceTypeRef = useRef('desktop');
+  const streamRef = useRef(null);
 
   const [status, setStatus] = useState('loading');
   const [error, setError] = useState(null);
@@ -22,61 +20,63 @@ function App() {
   const [calibrationComplete, setCalibrationComplete] = useState(false);
   const [pixelsPerMM, setPixelsPerMM] = useState(null);
   const [selectedReferenceBox, setSelectedReferenceBox] = useState(null);
-  const [orientation, setOrientation] = useState(
-    window.screen.orientation?.type || 'landscape-primary'
-  );
+  const [facingMode, setFacingMode] = useState('environment');
 
-  // Detect device type and orientation
-  useEffect(() => {
-    deviceTypeRef.current = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) 
-      ? 'mobile' 
-      : 'desktop';
-
-    const handleOrientationChange = () => {
-      setOrientation(window.screen.orientation?.type || 'landscape-primary');
-    };
-
-    window.addEventListener('orientationchange', handleOrientationChange);
-    return () => {
-      window.removeEventListener('orientationchange', handleOrientationChange);
-    };
-  }, []);
-
-  // Initialize webcam with proper constraints for mobile
-  useEffect(() => {
-    const constraints = {
-      video: { 
-        facingMode: 'environment',
-        width: { ideal: MODEL_INPUT_SIZE },
-        height: { ideal: MODEL_INPUT_SIZE },
-        frameRate: { ideal: deviceTypeRef.current === 'mobile' ? 15 : 30 }
+  // Initialize webcam with error handling
+  const initCamera = useCallback(async () => {
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
       }
-    };
 
-    navigator.mediaDevices.getUserMedia(constraints)
-      .then(stream => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.onloadedmetadata = () => {
-            videoRef.current.play().catch(e => {
+      const constraints = {
+        video: {
+          facingMode,
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      streamRef.current = stream;
+
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        await new Promise((resolve) => {
+          video.onloadedmetadata = () => {
+            video.play().then(resolve).catch(e => {
               setError('Playback error: ' + e.message);
               setStatus('error');
+              resolve();
             });
           };
-        }
-      })
-      .catch(e => {
-        setError('Camera error: ' + e.message);
-        setStatus('error');
-      });
-  }, []);
+        });
+      }
+    } catch (e) {
+      setError('Camera error: ' + e.message);
+      setStatus('error');
+    }
+  }, [facingMode]);
+
+  // Initialize webcam
+  useEffect(() => {
+    initCamera();
+    
+    return () => {
+      const stream = streamRef.current;
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [initCamera]);
 
   // Initialize worker and load model
   useEffect(() => {
-    workerRef.current = new Worker('onnxWorker.js');
-    const worker = workerRef.current;
+const worker = new Worker(new URL('./onnxWorker.js', import.meta.url));
+    workerRef.current = worker;
 
-    worker.onmessage = e => {
+    worker.onmessage = (e) => {
       const { type } = e.data;
 
       if (type === 'loaded') {
@@ -96,48 +96,34 @@ function App() {
       }
     };
 
+    // Load model from public folder
     worker.postMessage({ type: 'loadModel', modelUrl: '/best.onnx' });
 
-    return () => worker.terminate();
+    return () => {
+      worker.terminate();
+    };
   }, []);
 
-  function preprocess(frame) {
-    const offscreen = new OffscreenCanvas(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-    const ctx = offscreen.getContext('2d', { willReadFrequently: false });
-    
-    // Maintain aspect ratio while resizing
-    const aspectRatio = frame.videoWidth / frame.videoHeight;
-    let drawWidth, drawHeight, offsetX = 0, offsetY = 0;
-    
-    if (aspectRatio > 1) {
-      drawWidth = MODEL_INPUT_SIZE;
-      drawHeight = MODEL_INPUT_SIZE / aspectRatio;
-      offsetY = (MODEL_INPUT_SIZE - drawHeight) / 2;
-    } else {
-      drawHeight = MODEL_INPUT_SIZE;
-      drawWidth = MODEL_INPUT_SIZE * aspectRatio;
-      offsetX = (MODEL_INPUT_SIZE - drawWidth) / 2;
-    }
-    
-    ctx.fillStyle = 'black';
-    ctx.fillRect(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-    ctx.drawImage(frame, offsetX, offsetY, drawWidth, drawHeight);
-    
+  const preprocess = useCallback((frame) => {
+    const offscreen = document.createElement('canvas');
+    offscreen.width = MODEL_INPUT_SIZE;
+    offscreen.height = MODEL_INPUT_SIZE;
+    const ctx = offscreen.getContext('2d');
+    ctx.drawImage(frame, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
     const imgData = ctx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE).data;
-    const data = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
-    
-    // Normalize pixel values to 0-1 and convert to RGB format
+
+    const data = new Float32Array(1 * 3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
     for (let i = 0; i < MODEL_INPUT_SIZE * MODEL_INPUT_SIZE; i++) {
-      data[i] = imgData[i * 4] / 255.0;         // R
-      data[i + MODEL_INPUT_SIZE * MODEL_INPUT_SIZE] = imgData[i * 4 + 1] / 255.0; // G
-      data[i + 2 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE] = imgData[i * 4 + 2] / 255.0; // B
+      data[i] = imgData[i * 4] / 255;
+      data[i + MODEL_INPUT_SIZE * MODEL_INPUT_SIZE] = imgData[i * 4 + 1] / 255;
+      data[i + 2 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE] = imgData[i * 4 + 2] / 255;
     }
 
     return data.buffer;
-  }
+  }, []);
 
-  function parseYOLOv5Output(data, dims) {
-    const [batch, num_boxes, num_attrs] = dims;
+  const parseYOLOv5Output = useCallback((data, dims) => {
+    const [, num_boxes, num_attrs] = dims;
     const boxes = [];
 
     for (let i = 0; i < num_boxes; i++) {
@@ -171,9 +157,9 @@ function App() {
     }
 
     return boxes;
-  }
+  }, []);
 
-  function nonMaxSuppression(boxes) {
+  const nonMaxSuppression = useCallback((boxes) => {
     const sortedBoxes = [...boxes].sort((a, b) => b.confidence - a.confidence);
     const selectedBoxes = [];
 
@@ -192,9 +178,9 @@ function App() {
     }
 
     return selectedBoxes;
-  }
+  }, []);
 
-  function calculateIoU(box1, box2) {
+  const calculateIoU = useCallback((box1, box2) => {
     const x1 = Math.max(box1.x1, box2.x1);
     const y1 = Math.max(box1.y1, box2.y1);
     const x2 = Math.min(box1.x2, box2.x2);
@@ -206,33 +192,33 @@ function App() {
     const union = area1 + area2 - intersection;
 
     return intersection / union;
-  }
+  }, []);
 
-  function calculatePhysicalSize(box, ppm) {
+  const calculatePhysicalSize = useCallback((box, ppm) => {
     if (!ppm || isNaN(ppm)) return null;
     
     const widthPx = box.width * MODEL_INPUT_SIZE;
     const heightPx = box.height * MODEL_INPUT_SIZE;
     const diameterPx = (widthPx + heightPx) / 2;
     return diameterPx / ppm;
-  }
+  }, []);
 
-  function handleBoxClick(box) {
+  const handleBoxClick = useCallback((box) => {
     if (calibrationMode) {
       setSelectedReferenceBox(box);
     }
-  }
+  }, [calibrationMode]);
 
-  function startCalibration() {
+  const startCalibration = useCallback(() => {
     if (referenceSize > 0 && !isNaN(referenceSize)) {
       setCalibrationMode(true);
       setError(null);
     } else {
       setError('Please enter a valid reference size first');
     }
-  }
+  }, [referenceSize]);
 
-  function completeCalibration() {
+  const completeCalibration = useCallback(() => {
     if (selectedReferenceBox && referenceSize > 0 && !isNaN(referenceSize)) {
       const widthPx = selectedReferenceBox.width * MODEL_INPUT_SIZE;
       const heightPx = selectedReferenceBox.height * MODEL_INPUT_SIZE;
@@ -246,25 +232,30 @@ function App() {
     } else {
       setError('Please select a reference object and ensure valid size');
     }
-  }
+  }, [selectedReferenceBox, referenceSize]);
 
-  function resetCalibration() {
+  const resetCalibration = useCallback(() => {
     setCalibrationComplete(false);
     setPixelsPerMM(null);
     setSelectedReferenceBox(null);
     setCalibrationMode(false);
-  }
+  }, []);
 
-  // Drawing + inference loop with mobile optimizations
+  const toggleCamera = useCallback(() => {
+    setFacingMode(prev => prev === 'environment' ? 'user' : 'environment');
+  }, []);
+
+  // Drawing + inference loop
   useEffect(() => {
     if (status !== 'ready' || !videoRef.current) return;
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d', { willReadFrequently: false });
+    const ctx = canvas.getContext('2d');
 
     let animationFrameId;
     let lastInferenceTime = 0;
+    const inferenceInterval = 200; // Run inference every 200ms
 
     const run = () => {
       if (!video || video.readyState < 2) {
@@ -272,7 +263,6 @@ function App() {
         return;
       }
 
-      // Adjust canvas size to match video feed
       if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -310,17 +300,19 @@ function App() {
           }
         }
 
+        ctx.font = '14px Arial';
         ctx.fillStyle = 'white';
-        ctx.fillRect(x - 2, y - 18, ctx.measureText(labelText).width + 4, 18);
+        const textWidth = ctx.measureText(labelText).width;
+        ctx.fillRect(x - 2, y - 18, textWidth + 4, 18);
         ctx.fillStyle = 'black';
-        ctx.font = '12px Arial';
         ctx.fillText(labelText, x, y - 4);
       });
 
-      // Run inference only if not already processing and enough frames have passed
-      frameCountRef.current++;
-      if (!isProcessingRef.current && frameCountRef.current % (deviceTypeRef.current === 'mobile' ? FRAME_SKIP + 1 : 1) === 0) {
+      // Run inference only if not already processing and enough time has passed
+      const now = performance.now();
+      if (!isProcessingRef.current && now - lastInferenceTime > inferenceInterval) {
         isProcessingRef.current = true;
+        lastInferenceTime = now;
         const tensorData = preprocess(video);
         workerRef.current.postMessage({
           type: 'infer',
@@ -335,7 +327,7 @@ function App() {
     animationFrameId = requestAnimationFrame(run);
 
     return () => cancelAnimationFrame(animationFrameId);
-  }, [status, boxes, calibrationMode, selectedReferenceBox, pixelsPerMM]);
+  }, [status, boxes, calibrationMode, selectedReferenceBox, pixelsPerMM, preprocess, calculatePhysicalSize]);
 
   return (
     <div style={{ padding: '20px', maxWidth: '800px', margin: '0 auto' }}>
@@ -379,6 +371,10 @@ function App() {
             <button onClick={resetCalibration}>Recalibrate</button>
           </div>
         )}
+
+        <button onClick={toggleCamera} style={{ marginTop: '10px' }}>
+          Switch Camera ({facingMode === 'environment' ? 'Rear' : 'Front'})
+        </button>
       </div>
 
       <video
